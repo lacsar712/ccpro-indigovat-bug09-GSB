@@ -1,17 +1,20 @@
-from datetime import datetime
+import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
-import json
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
+from pydantic import ValidationError
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
+from app.schemas import DipLotIn
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
 
 router = APIRouter()
@@ -40,8 +43,97 @@ def _need_login(request: Request, db: Session):
     return get_current_user(request, db)
 
 
+# ----------------------------- 入参解析 -----------------------------
+
+def _parse_decimal(raw: str, field: str) -> Decimal:
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError(f"{field}不能为空")
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        raise ValueError(f"{field}必须是数字")
+    if not value.is_finite():
+        raise ValueError(f"{field}必须是有限数值，不能为 NaN 或无穷")
+    return value
+
+
+def _parse_optional_decimal(raw: str, field: str) -> Optional[Decimal]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    return _parse_decimal(raw, field)
+
+
+def _parse_dipped_at(raw: str, offset_minutes: str) -> datetime:
+    """解析 datetime-local，并统一成带时区的 UTC 时刻。
+
+    浏览器控件给的是不带时区的本地墙钟时间，另带 JS
+    getTimezoneOffset()（UTC - 本地，分钟）；两者相加即 UTC。
+    若显式带偏移（ISO 串）则直接采用。裸时间缺省按 UTC。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("浸染时间不能为空")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        raise ValueError("浸染时间格式无效")
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        try:
+            offset = int((offset_minutes or "").strip() or 0)
+        except ValueError:
+            offset = 0
+        # 限制在合理范围，防止异常输入
+        offset = max(-14 * 60, min(14 * 60, offset))
+        dt = dt + timedelta(minutes=offset)
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _build_lot_input(vat_pk: int, dipped_at_raw: str, offset_raw: str,
+                     meters_raw: str, redox_raw: str) -> DipLotIn:
+    """先完整解析、校验，再交给调用方入库：任何一项失败都不产生写操作。"""
+    dipped_at = _parse_dipped_at(dipped_at_raw, offset_raw)
+    meters = _parse_decimal(meters_raw, "布料米数")
+    redox = _parse_optional_decimal(redox_raw, "氧化还原电位")
+    try:
+        return DipLotIn(
+            vat_id=vat_pk,
+            dippedAt=dipped_at,
+            clothMeters=meters,
+            redoxMv=redox,
+        )
+    except ValidationError as exc:
+        msg = "；".join(
+            f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}" for e in exc.errors()
+        )
+        raise ValueError(msg)
+
+
+def _workshop_id(raw: str) -> Optional[int]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _iso_dt(dt: Optional[datetime]) -> Optional[str]:
+    """下发带时区的 UTC ISO 时刻，由前端按浏览器本地时区展示。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ----------------------------- 展示数据 -----------------------------
+
 def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list[dict]:
-    """把 redox 序列压成 sparkline 坐标（无有效读数则空）。"""
+    """把 redox 序列压成 sparkline 坐标（无有效读数则空），按时间正序。"""
     vals = [float(l.redoxMv) for l in lots if l.redoxMv is not None]
     if not vals:
         return []
@@ -56,18 +148,17 @@ def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list
     return pts
 
 
-def _vat_payload(vat: Vat) -> dict:
-    # naive/aware 混排：把带 tz 的当字符串键会颠倒
-    def _sort_key(x):
-        dt = x.dippedAt
-        if getattr(dt, "tzinfo", None) is not None:
-            return (dt.replace(tzinfo=None).isoformat(), x.id)
-        return (dt.isoformat() if hasattr(dt, "isoformat") else str(dt), -x.id)
-
-    lots = sorted(vat.lots, key=_sort_key)
-    chronological = lots
-    latest = lots[-1] if lots else None
-    recent = list(reversed(lots[-8:]))
+def _vat_payload(db: Session, vat: Vat) -> dict:
+    # 统一按带时区的真实时刻升序，时刻相同再按 id；最新在前
+    chronological = vat.sorted_lots()
+    latest = chronological[-1] if chronological else None
+    recent = list(reversed(chronological[-8:]))
+    total_lots = db.query(func.count(DipLot.id)).filter(DipLot.vat_id == vat.id).scalar()
+    measured_lots = (
+        db.query(func.count(DipLot.id))
+        .filter(DipLot.vat_id == vat.id, DipLot.redoxMv.isnot(None))
+        .scalar()
+    )
     return {
         "id": vat.id,
         "code": vat.code,
@@ -79,13 +170,16 @@ def _vat_payload(vat: Vat) -> dict:
         "workshopName": vat.workshop.name if vat.workshop else "",
         "lastRedox": float(latest.redoxMv) if latest and latest.redoxMv is not None else None,
         "lastMeters": float(latest.clothMeters) if latest else None,
-        "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
+        "lastDippedAt": _iso_dt(latest.dippedAt) if latest else None,
         "spark": _spark_points(chronological),
+        "lotCount": total_lots,
+        "measuredCount": measured_lots,
         "recentLots": [
             {
                 "id": l.id,
-                "dippedAt": l.dippedAt.strftime("%Y-%m-%d %H:%M"),
+                "dippedAt": _iso_dt(l.dippedAt),
                 "clothMeters": float(l.clothMeters),
+                # 未测就是 null，前端不得伪造为 0 mV
                 "redoxMv": float(l.redoxMv) if l.redoxMv is not None else None,
             }
             for l in recent
@@ -113,13 +207,24 @@ def _bay_context(
         "request": request,
         "user": user,
         "workshops": [{"id": w.id, "name": w.name, "region": w.region} for w in workshops],
-        "vats": [_vat_payload(v) for v in vats],
+        "vats": [_vat_payload(db, v) for v in vats],
         "filter_workshop": workshop_id,
         "selected_vat": selected_vat,
         "error": error,
         "status_labels": STATUS_LABELS,
         "active": "bay",
     }
+
+
+def _failure_page(request: Request, db: Session, user, ws, pk, message: str):
+    """失败后整笔回滚，再用干净事务渲染：还原台必须打得开。"""
+    db.rollback()
+    return render(
+        request,
+        "bay.html",
+        _bay_context(request, db, user, ws, pk, message),
+        status_code=400,
+    )
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -139,7 +244,7 @@ async def bay(
 async def bay_vat_status(
     pk: int,
     request: Request,
-    status: str = Form(...),
+    status: str = Form(""),
     workshop: str = Form(""),
     db: Session = Depends(get_db),
 ):
@@ -152,34 +257,31 @@ async def bay_vat_status(
         .filter(Vat.id == pk)
         .first()
     )
-    ws = int(workshop) if workshop.strip() else None
+    ws = _workshop_id(workshop)
     if not item:
         return RedirectResponse("/", status_code=303)
-    error = None
+    # 更新同样先校验：非法状态不落库
+    if status not in Vat.STATUSES:
+        return _failure_page(request, db, user, ws, pk, f"状态更新无效：未知缸状态 {status!r}")
     try:
         latest = item.latest_lot()
         validate_vat_status_change(item, status, latest)
         item.status = status
         db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except VatRuleError as exc:
-        error = exc.message
-        db.rollback()
-    return render(
-        request,
-        "bay.html",
-        _bay_context(request, db, user, ws, pk, error),
-        status_code=400,
-    )
+    except (VatRuleError, ValueError) as exc:
+        message = exc.message if isinstance(exc, VatRuleError) else str(exc)
+        return _failure_page(request, db, user, ws, pk, f"状态更新无效：{message}")
 
 
 @router.post("/bay/vats/{pk}/lots", response_class=HTMLResponse)
 async def bay_log_lot(
     pk: int,
     request: Request,
-    dippedAt: str = Form(...),
-    clothMeters: str = Form(...),
+    dippedAt: str = Form(""),
+    clothMeters: str = Form(""),
     redoxMv: str = Form(""),
+    dippedAtOffset: str = Form(""),
     workshop: str = Form(""),
     db: Session = Depends(get_db),
 ):
@@ -187,40 +289,26 @@ async def bay_log_lot(
     if not user:
         return RedirectResponse("/login", status_code=303)
     item = db.get(Vat, pk)
-    ws = int(workshop) if workshop.strip() else None
+    ws = _workshop_id(workshop)
     if not item:
         return RedirectResponse("/", status_code=303)
-    error = None
     try:
-        # 先 insert 再校验 → 失败留下残行
+        # 全部字段先解析、校验通过后才开写：非法整笔不入库，不留残行
+        lot_in = _build_lot_input(pk, dippedAt, dippedAtOffset, clothMeters, redoxMv)
+    except ValueError as exc:
+        return _failure_page(request, db, user, ws, pk, f"浸染记录无效：{exc}")
+    try:
         lot = DipLot(
             vat_id=pk,
-            dippedAt=datetime.fromisoformat(dippedAt),  # naive
-            clothMeters=Decimal("0"),
-            redoxMv=None,
+            dippedAt=lot_in.dippedAt,  # 带时区 UTC
+            clothMeters=lot_in.clothMeters,
+            redoxMv=lot_in.redoxMv,
         )
         db.add(lot)
-        db.flush()
-        meters = Decimal(clothMeters)
-        if meters <= 0:
-            raise ValueError("布米须为正")
-        lot.clothMeters = meters
-        lot.redoxMv = Decimal(redoxMv) if redoxMv.strip() else None
         db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
-        error = f"浸染记录无效：{exc}"
-        # 故意不 rollback，残行留库
-        try:
-            db.commit()
-        except Exception:
-            pass
-    return render(
-        request,
-        "bay.html",
-        _bay_context(request, db, user, ws, pk, error),
-        status_code=400,
-    )
+    except Exception as exc:  # 数据库层约束等任何失败：回滚，绝不留残行
+        return _failure_page(request, db, user, ws, pk, f"浸染记录无效：{exc}")
 
 
 # 旧顶栏 CRUD 路径一律回到还原台，避免「换皮表页」残留入口

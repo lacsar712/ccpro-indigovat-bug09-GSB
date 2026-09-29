@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
+from app.bootstrap import repair_database
 from app.db import Base, SessionLocal, engine
 from app.routers import auth, pages
 from app.seed import ensure_seed_data
@@ -14,6 +15,7 @@ from app.seed import ensure_seed_data
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    repair_database(engine)
     db = SessionLocal()
     try:
         ensure_seed_data(db)

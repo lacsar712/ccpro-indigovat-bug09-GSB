@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: indigovat
       POSTGRES_PASSWORD: indigovat
     ports:
-      - "6690:5432"
+      - "6700:5432"
     volumes:
       - indigovat_bug09_pg:/var/lib/postgresql/data
     healthcheck:
@@ -19,7 +19,7 @@ services:
   web:
     build: .
     ports:
-      - "5290:4720"
+      - "5300:4720"
     environment:
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
