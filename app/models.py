@@ -1,6 +1,8 @@
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     Boolean,
@@ -14,6 +16,20 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+
+# 浏览器提交的 datetime-local 是不带时区的本地墙钟时间，统一按此时区标注后入库。
+APP_TZ = ZoneInfo(os.environ.get("APP_TZ", "Asia/Shanghai"))
+
+
+def lot_aware_dt(dt: datetime) -> datetime:
+    """把浸染时刻归一化为带时区的 UTC datetime，供存储后比较与排序。
+
+    - 已带时区：直接换算到 UTC；
+    - 无时区（旧数据/裸表单值）：视为 APP_TZ 本地时间，再换算到 UTC。
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=APP_TZ)
+    return dt.astimezone(timezone.utc)
 
 
 class User(Base):
@@ -59,7 +75,11 @@ class Vat(Base):
     def latest_lot(self) -> Optional["DipLot"]:
         if not self.lots:
             return None
-        return sorted(self.lots, key=lambda x: (x.dippedAt, x.id), reverse=True)[0]
+        return sorted(
+            self.lots,
+            key=lambda x: (lot_aware_dt(x.dippedAt), x.id),
+            reverse=True,
+        )[0]
 
 
 class DipLot(Base):

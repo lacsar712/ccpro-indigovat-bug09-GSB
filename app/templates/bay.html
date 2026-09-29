@@ -83,7 +83,7 @@
         <div class="panel-grid">
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">登记浸染</h3>
-            <form method="post" :action="'/bay/vats/' + selected().id + '/lots'">
+            <form method="post" :action="'/bay/vats/' + selected().id + '/lots" @submit="submitting = true">
               <input type="hidden" name="workshop" :value="filterWs || ''">
               <label>浸染时间
                 <input type="datetime-local" name="dippedAt" required :value="nowLocal()">
@@ -94,12 +94,12 @@
               <label>氧化还原电位 (mV，可空)
                 <input type="number" name="redoxMv" step="0.01" placeholder="例如 -520">
               </label>
-              <button type="submit">写入本缸</button>
+              <button type="submit" :disabled="submitting" x-text="submitting ? '提交中…' : '写入本缸'"></button>
             </form>
           </div>
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">改缸状态</h3>
-            <form method="post" :action="'/bay/vats/' + selected().id + '/status'">
+            <form method="post" :action="'/bay/vats/' + selected().id + '/status'" @submit="submitting = true">
               <input type="hidden" name="workshop" :value="filterWs || ''">
               <label>目标状态
                 <select name="status" required :value="selected().status">
@@ -108,9 +108,13 @@
                   <option value="ready">可染色</option>
                 </select>
               </label>
-              <button type="submit">更新状态</button>
+              <button type="submit" :disabled="submitting" x-text="submitting ? '提交中…' : '更新状态'"></button>
             </form>
-            <h3 style="font-size:0.95rem;margin:1.25rem 0 0.4rem;color:#1f4d6b">近几笔浸染</h3>
+            <h3 style="font-size:0.95rem;margin:1.25rem 0 0.4rem;color:#1f4d6b">
+              近几笔浸染
+              <span style="font-weight:400;font-size:0.78rem;color:#6b7c85"
+                    x-text="'（近 ' + selected().recentLots.length + ' / 共 ' + selected().lotCount + ' 笔，有效电位 ' + selected().measuredCount + ' 笔）'"></span>
+            </h3>
             <ul class="lot-list">
               <template x-for="l in selected().recentLots" :key="l.id">
                 <li>
@@ -118,7 +122,12 @@
                   <span>
                     <span x-text="l.clothMeters + ' m'"></span>
                     ·
-                    <span x-text="(l.redoxMv === null || l.redoxMv === undefined) ? ('0 mV') : (l.redoxMv + ' mV')"></span>
+                    <template x-if="l.redoxMv === null || l.redoxMv === undefined">
+                      <span class="redox-null">电位未测</span>
+                    </template>
+                    <template x-if="l.redoxMv !== null && l.redoxMv !== undefined">
+                      <span x-text="l.redoxMv + ' mV'"></span>
+                    </template>
                   </span>
                 </li>
               </template>
@@ -140,6 +149,7 @@
       vats: {{ vats | tojson }},
       filterWs: {{ filter_workshop if filter_workshop is not none else 'null' }},
       selectedId: {{ selected_vat if selected_vat is not none else 'null' }},
+      submitting: false,
       init() {
         const params = new URLSearchParams(window.location.search);
         if (params.has('workshop') && this.filterWs === null) {

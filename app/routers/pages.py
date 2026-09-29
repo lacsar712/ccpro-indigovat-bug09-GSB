@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
 from app.db import get_db
-from app.models import DipLot, Vat, Workshop
+from app.models import DipLot, Vat, Workshop, APP_TZ, lot_aware_dt
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
 
 router = APIRouter()
@@ -19,7 +19,7 @@ templates = Jinja2Templates(directory="app/templates")
 
 
 def _tojson(value):
-    return markupsafe.Markup(json.dumps(value, ensure_ascii=False))
+    return markupsafe.Markup(json.dumps(value, ensure_ascii=False, default=str))
 
 
 templates.env.filters["tojson"] = _tojson
@@ -29,6 +29,7 @@ STATUS_LABELS = {
     Vat.STATUS_REDUCING: "还原中",
     Vat.STATUS_READY: "可染色",
 }
+VALID_STATUSES = frozenset(STATUS_LABELS)
 
 
 def render(request: Request, name: str, context: dict, status_code: int = 200):
@@ -56,18 +57,21 @@ def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list
     return pts
 
 
-def _vat_payload(vat: Vat) -> dict:
-    # naive/aware 混排：把带 tz 的当字符串键会颠倒
-    def _sort_key(x):
-        dt = x.dippedAt
-        if getattr(dt, "tzinfo", None) is not None:
-            return (dt.replace(tzinfo=None).isoformat(), x.id)
-        return (dt.isoformat() if hasattr(dt, "isoformat") else str(dt), -x.id)
+def _fmt_dt(dt: datetime) -> str:
+    """存储/排序按 UTC；展示按应用时区还原成本地墙钟。"""
+    return lot_aware_dt(dt).astimezone(APP_TZ).strftime("%Y-%m-%d %H:%M")
 
-    lots = sorted(vat.lots, key=_sort_key)
-    chronological = lots
-    latest = lots[-1] if lots else None
-    recent = list(reversed(lots[-8:]))
+
+def _vat_payload(vat: Vat) -> dict:
+    # 时刻统一按带时区归一化后排序：最新在前；同一时刻按 id 新者在前。
+    lots = sorted(
+        vat.lots,
+        key=lambda x: (lot_aware_dt(x.dippedAt), x.id),
+        reverse=True,
+    )
+    latest = lots[0] if lots else None
+    recent = lots[:8]
+    measured = [l for l in lots if l.redoxMv is not None]
     return {
         "id": vat.id,
         "code": vat.code,
@@ -79,17 +83,22 @@ def _vat_payload(vat: Vat) -> dict:
         "workshopName": vat.workshop.name if vat.workshop else "",
         "lastRedox": float(latest.redoxMv) if latest and latest.redoxMv is not None else None,
         "lastMeters": float(latest.clothMeters) if latest else None,
-        "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
-        "spark": _spark_points(chronological),
+        "lastDippedAt": _fmt_dt(latest.dippedAt) if latest else None,
+        # 时间正序喂给 sparkline；只含真实读到的电位，不补零。
+        "spark": _spark_points(list(reversed(lots))),
         "recentLots": [
             {
                 "id": l.id,
-                "dippedAt": l.dippedAt.strftime("%Y-%m-%d %H:%M"),
+                "dippedAt": _fmt_dt(l.dippedAt),
                 "clothMeters": float(l.clothMeters),
+                # 展示层不伪造电位：空读数保持 null，前端显式标「未测」。
                 "redoxMv": float(l.redoxMv) if l.redoxMv is not None else None,
             }
             for l in recent
         ],
+        # 对账字段：近笔条数与库内非空电位笔数可核对。
+        "lotCount": len(lots),
+        "measuredCount": len(measured),
     }
 
 
@@ -109,11 +118,15 @@ def _bay_context(
         .order_by(Vat.code)
         .all()
     )
+    payloads = [_vat_payload(v) for v in vats]
+    # 失败回滚后也保证展开区有数据：选中缸不存在于本页数据时不挂空引用。
+    if selected_vat is not None and not any(p["id"] == selected_vat for p in payloads):
+        selected_vat = None
     return {
         "request": request,
         "user": user,
         "workshops": [{"id": w.id, "name": w.name, "region": w.region} for w in workshops],
-        "vats": [_vat_payload(v) for v in vats],
+        "vats": payloads,
         "filter_workshop": workshop_id,
         "selected_vat": selected_vat,
         "error": error,
@@ -157,6 +170,8 @@ async def bay_vat_status(
         return RedirectResponse("/", status_code=303)
     error = None
     try:
+        if status not in VALID_STATUSES:
+            raise VatRuleError(f"未知缸状态：{status or '（空）'}")
         latest = item.latest_lot()
         validate_vat_status_change(item, status, latest)
         item.status = status
@@ -173,12 +188,45 @@ async def bay_vat_status(
     )
 
 
+def _parse_lot_form(dippedAt: str, clothMeters: str, redoxMv: str) -> tuple[datetime, Decimal, Optional[Decimal]]:
+    """整笔先解析并校验，任何一项不合法即抛 ValueError —— 调用方必须不入库。"""
+    dipped_at = dippedAt.strip()
+    if not dipped_at:
+        raise ValueError("浸染时间不能为空")
+    try:
+        dt = datetime.fromisoformat(dipped_at)
+    except ValueError:
+        raise ValueError("浸染时间格式无效")
+    dt = lot_aware_dt(dt)
+
+    meters_raw = clothMeters.strip().replace(",", "")
+    if not meters_raw:
+        raise ValueError("布米数不能为空")
+    try:
+        meters = Decimal(meters_raw)
+    except InvalidOperation:
+        raise ValueError("布米数不是有效数字")
+    if not meters.is_finite() or meters <= 0:
+        raise ValueError("布米须为正数")
+
+    redox_raw = redoxMv.strip().replace(",", "")
+    redox: Optional[Decimal] = None
+    if redox_raw:
+        try:
+            redox = Decimal(redox_raw)
+        except InvalidOperation:
+            raise ValueError("氧化还原电位不是有效数字")
+        if not redox.is_finite():
+            raise ValueError("氧化还原电位不是有效数字")
+    return dt, meters, redox
+
+
 @router.post("/bay/vats/{pk}/lots", response_class=HTMLResponse)
 async def bay_log_lot(
     pk: int,
     request: Request,
-    dippedAt: str = Form(...),
-    clothMeters: str = Form(...),
+    dippedAt: str = Form(""),
+    clothMeters: str = Form(""),
     redoxMv: str = Form(""),
     workshop: str = Form(""),
     db: Session = Depends(get_db),
@@ -192,29 +240,24 @@ async def bay_log_lot(
         return RedirectResponse("/", status_code=303)
     error = None
     try:
-        # 先 insert 再校验 → 失败留下残行
+        # 先把整笔解析校验通过，再构造对象 —— 非法提交（含并发、连点）零残行。
+        dt, meters, redox = _parse_lot_form(dippedAt, clothMeters, redoxMv)
         lot = DipLot(
             vat_id=pk,
-            dippedAt=datetime.fromisoformat(dippedAt),  # naive
-            clothMeters=Decimal("0"),
-            redoxMv=None,
+            dippedAt=dt,
+            clothMeters=meters,
+            redoxMv=redox,
         )
         db.add(lot)
-        db.flush()
-        meters = Decimal(clothMeters)
-        if meters <= 0:
-            raise ValueError("布米须为正")
-        lot.clothMeters = meters
-        lot.redoxMv = Decimal(redoxMv) if redoxMv.strip() else None
         db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
+    except ValueError as exc:
         error = f"浸染记录无效：{exc}"
-        # 故意不 rollback，残行留库
-        try:
-            db.commit()
-        except Exception:
-            pass
+        db.rollback()
+    except Exception:
+        # 任何意外（DB 错误/并发冲突等）都不允许留下半笔。
+        db.rollback()
+        raise
     return render(
         request,
         "bay.html",
